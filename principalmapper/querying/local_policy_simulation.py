@@ -34,6 +34,48 @@ from principalmapper.util.case_insensitive_dict import CaseInsensitiveDict
 logger = logging.getLogger(__name__)
 
 
+class UnsupportedConditionOperatorError(ValueError):
+    """Raised when a policy statement uses a condition operator that the local policy simulator does not know how
+    to evaluate.
+
+    Silently skipping an unrecognized operator would make a statement match more often than it should (an Allow
+    statement could be evaluated as a match even though its condition was never checked), so evaluation fails closed
+    by raising this error and surfacing the unsupported operator to the caller instead of treating it as satisfied.
+    """
+
+
+# Condition operators that this module knows how to evaluate, minus any qualifier.
+_SUPPORTED_CONDITION_OPERATORS = frozenset((
+    # String
+    'StringEquals', 'StringNotEquals', 'StringEqualsIgnoreCase', 'StringNotEqualsIgnoreCase',
+    'StringLike', 'StringNotLike',
+    # Numeric
+    'NumericEquals', 'NumericNotEquals', 'NumericLessThan', 'NumericLessThanEquals',
+    'NumericGreaterThan', 'NumericGreaterThanEquals',
+    # Date
+    'DateEquals', 'DateNotEquals', 'DateLessThan', 'DateLessThanEquals',
+    'DateGreaterThan', 'DateGreaterThanEquals',
+    # Bool, binary, IP, ARN and null
+    'Bool', 'BinaryEquals', 'IpAddress', 'NotIpAddress',
+    'ArnEquals', 'ArnLike', 'ArnNotEquals', 'ArnNotLike',
+    'Null',
+))
+
+
+def _normalize_condition_operator(block: str) -> str:
+    """Helper function: strips the ``ForAllValues:``/``ForAnyValue:`` prefix and ``IfExists`` suffix from a condition
+    operator block name, returning the underlying operator.
+    """
+    normalized = block
+    for qualifier in ('ForAllValues:', 'ForAnyValue:'):
+        if normalized.startswith(qualifier):
+            normalized = normalized[len(qualifier):]
+            break
+    if normalized.endswith('IfExists'):
+        normalized = normalized[:-len('IfExists')]
+    return normalized
+
+
 def has_matching_statement(principal: Node, effect_value: str, action_to_check: str, resource_to_check: str,
                            condition_keys_to_check: CaseInsensitiveDict) -> bool:
     """Locally determine if a node's attached policies (and group's policies if applicable) has at least one matching
@@ -125,6 +167,14 @@ def _get_condition_match(condition: Dict[str, Dict[str, Union[str, List]]], cont
     See: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html
     """
     for block in condition.keys():
+        # Fail closed: an operator the simulator does not implement must not be silently treated as satisfied,
+        # otherwise an Allow statement could be evaluated as a match without its condition ever being checked.
+        normalized_block = _normalize_condition_operator(block)
+        if normalized_block not in _SUPPORTED_CONDITION_OPERATORS:
+            raise UnsupportedConditionOperatorError(
+                'Unsupported condition operator in policy statement: {}'.format(block)
+            )
+
         # String operators
         if 'String' in block:
             # string comparison after expansion
@@ -825,19 +875,17 @@ def policies_include_matching_allow_action(principal: Node, action_to_check: str
 def _statement_matches_action(statement: dict, action: str, condition_keys: Optional[CaseInsensitiveDict] = None,
                               is_resource_policy_check: bool = False) -> bool:
     """Helper function, returns True if the given action is in the given policy statement"""
-    exempted_services = ('sns', 'sqs')
     if 'Action' in statement:
         for item in _listify_string(statement['Action']):
             if not is_resource_policy_check:
                 if _matches_after_expansion(action, item, condition_keys):
                     return True
             else:
-                if action.startswith('SNS') or action.startswith('SQS') or item.startswith('SNS') or item.startswith(
-                        'SQS'):
-                    action_parts = action.split(':')
-                    item_parts = action.split(':')
-                    new_action = '{}:{}'.format(action_parts[0].lower(), action_parts[1])
-                    new_item = '{}:{}'.format(item_parts[0].lower(), item_parts[1])
+                if _is_sns_or_sqs_action(action) or _is_sns_or_sqs_action(item):
+                    # SNS/SQS resource policies may use an upper-cased service prefix; normalize both sides
+                    # before matching so the policy's action segment is the one actually compared.
+                    new_action = _normalize_sns_sqs_action(action)
+                    new_item = _normalize_sns_sqs_action(item)
                     if _matches_after_expansion(new_action, new_item, condition_keys):
                         return True
                 else:
@@ -852,12 +900,9 @@ def _statement_matches_action(statement: dict, action: str, condition_keys: Opti
                     result = False
                     break
             else:
-                if action.startswith('SNS') or action.startswith('SQS') or item.startswith('SNS') or item.startswith(
-                        'SQS'):
-                    action_parts = action.split(':')
-                    item_parts = action.split(':')
-                    new_action = '{}:{}'.format(action_parts[0].lower(), action_parts[1])
-                    new_item = '{}:{}'.format(item_parts[0].lower(), item_parts[1])
+                if _is_sns_or_sqs_action(action) or _is_sns_or_sqs_action(item):
+                    new_action = _normalize_sns_sqs_action(action)
+                    new_item = _normalize_sns_sqs_action(item)
                     if _matches_after_expansion(new_action, new_item, condition_keys):
                         result = False
                         break
@@ -868,6 +913,25 @@ def _statement_matches_action(statement: dict, action: str, condition_keys: Opti
         return result
     else:
         return True
+
+
+def _is_sns_or_sqs_action(action: str) -> bool:
+    """Helper function: returns True if the given action uses the SNS or SQS service prefix (case-insensitive)."""
+    service_prefix = action.split(':', 1)[0].lower()
+    return service_prefix in ('sns', 'sqs')
+
+
+def _normalize_sns_sqs_action(action: str) -> str:
+    """Helper function: normalizes an SNS/SQS action to a lower-cased ``service:action`` form so that actions can be
+    compared regardless of the casing used for the service prefix in a resource policy.
+
+    Falls back to the original (lower-cased) value when the action does not contain a ``:`` separator, e.g. a bare
+    wildcard such as ``*``.
+    """
+    action_parts = action.split(':', 1)
+    if len(action_parts) < 2:
+        return action.lower()
+    return '{}:{}'.format(action_parts[0].lower(), action_parts[1])
 
 
 def _statement_matches_resource(statement: dict, resource: str, condition_keys: Optional[CaseInsensitiveDict] = None) -> bool:

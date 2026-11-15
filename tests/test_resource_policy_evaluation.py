@@ -22,7 +22,7 @@ from tests.build_test_graphs import *
 from tests.build_test_graphs import _build_user_with_policy
 
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult, \
-    _statement_matches_action
+    _statement_matches_action, UnsupportedConditionOperatorError
 from principalmapper.querying.query_interface import local_check_authorization_full
 
 
@@ -272,3 +272,138 @@ class LocalResourcePolicyEvalTests(unittest.TestCase):
             {},
             True
         ))
+
+    def test_sns_sqs_action_does_not_match_unrelated_actions(self):
+        """Regression test: an SNS/SQS resource-policy action must only match SNS/SQS actions, not arbitrary actions.
+
+        The action segment of the policy's action has to be normalized separately from the requested action; using
+        the requested action for both sides caused every action to be treated as a match.
+        """
+        publish_statement = {
+            'Effect': 'Allow',
+            'Action': 'SNS:Publish',
+            'Resource': '*'
+        }
+        # Only the matching SNS action hits
+        self.assertTrue(_statement_matches_action(publish_statement, 'sns:Publish', {}, True))
+        self.assertFalse(_statement_matches_action(publish_statement, 'sns:Subscribe', {}, True))
+        # Unrelated services must not match
+        self.assertFalse(_statement_matches_action(publish_statement, 's3:GetObject', {}, True))
+        self.assertFalse(_statement_matches_action(publish_statement, 'sqs:SendMessage', {}, True))
+        self.assertFalse(_statement_matches_action(publish_statement, 'ec2:RunInstances', {}, True))
+
+        # Wildcards still match within the SNS/SQS service
+        wildcard_statement = {
+            'Effect': 'Allow',
+            'Action': 'SNS:*',
+            'Resource': '*'
+        }
+        self.assertTrue(_statement_matches_action(wildcard_statement, 'sns:Subscribe', {}, True))
+        self.assertFalse(_statement_matches_action(wildcard_statement, 's3:GetObject', {}, True))
+
+    def test_sns_sqs_notaction_does_not_match_unrelated_actions(self):
+        """Regression test for the same normalization bug on the NotAction branch."""
+        not_publish_statement = {
+            'Effect': 'Allow',
+            'NotAction': 'SNS:Publish',
+            'Resource': '*'
+        }
+        # NotAction excludes sns:Publish only; unrelated actions remain allowed
+        self.assertFalse(_statement_matches_action(not_publish_statement, 'sns:Publish', {}, True))
+        self.assertTrue(_statement_matches_action(not_publish_statement, 's3:GetObject', {}, True))
+        self.assertTrue(_statement_matches_action(not_publish_statement, 'sns:Subscribe', {}, True))
+
+    def test_sns_sqs_resource_policy_authorization_is_scoped(self):
+        """End-to-end regression: a topic policy granting SNS:Publish must not authorize an unrelated action."""
+        iam_user = _build_user_with_policy(
+            {
+                'Version': '2012-10-17',
+                'Statement': [{
+                    'Effect': 'Allow',
+                    'Action': '*',
+                    'Resource': '*'
+                }]
+            },
+            'single_user_policy',
+            'asdf1',
+            '1'
+        )
+        topic_policy = {
+            'Version': '2012-10-17',
+            'Statement': [{
+                'Effect': 'Allow',
+                'Principal': '*',
+                'Action': 'SNS:Publish',
+                'Resource': 'arn:aws:sns:us-east-1:000000000000:topic'
+            }]
+        }
+        topic_arn = 'arn:aws:sns:us-east-1:000000000000:topic'
+
+        self.assertEqual(
+            resource_policy_authorization(iam_user, '000000000000', topic_policy, 'sns:Publish', topic_arn, {}),
+            ResourcePolicyEvalResult.NODE_MATCH
+        )
+        self.assertEqual(
+            resource_policy_authorization(iam_user, '000000000000', topic_policy, 's3:GetObject', topic_arn, {}),
+            ResourcePolicyEvalResult.NO_MATCH
+        )
+
+    def test_unsupported_condition_operator_fails_closed(self):
+        """An unrecognized condition operator must raise instead of being silently ignored (which would inflate an
+        Allow statement's match set)."""
+        iam_user = _build_user_with_policy(
+            {
+                'Version': '2012-10-17',
+                'Statement': [{
+                    'Effect': 'Allow',
+                    'Action': '*',
+                    'Resource': '*'
+                }]
+            },
+            'single_user_policy',
+            'asdf1',
+            '1'
+        )
+        policy_with_unknown_operator = {
+            'Version': '2012-10-17',
+            'Statement': [{
+                'Effect': 'Allow',
+                'Principal': '*',
+                'Action': 's3:GetObject',
+                'Resource': 'arn:aws:s3:::bucket/object',
+                'Condition': {
+                    'BogusOperator': {'aws:username': 'asdf1'}
+                }
+            }]
+        }
+        with self.assertRaises(UnsupportedConditionOperatorError):
+            resource_policy_authorization(
+                iam_user,
+                '000000000000',
+                policy_with_unknown_operator,
+                's3:GetObject',
+                'arn:aws:s3:::bucket/object',
+                {'aws:username': 'asdf1'}
+            )
+
+        qualified_unknown_operator = {
+            'ForAllValues:BogusOperator': {'aws:username': 'asdf1'}
+        }
+        with self.assertRaises(UnsupportedConditionOperatorError):
+            resource_policy_authorization(
+                iam_user,
+                '000000000000',
+                {
+                    'Version': '2012-10-17',
+                    'Statement': [{
+                        'Effect': 'Allow',
+                        'Principal': '*',
+                        'Action': 's3:GetObject',
+                        'Resource': 'arn:aws:s3:::bucket/object',
+                        'Condition': qualified_unknown_operator
+                    }]
+                },
+                's3:GetObject',
+                'arn:aws:s3:::bucket/object',
+                {'aws:username': 'asdf1'}
+            )

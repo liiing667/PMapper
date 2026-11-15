@@ -18,7 +18,7 @@
 import logging
 import unittest
 
-from principalmapper.querying.local_policy_simulation import _matches_after_expansion, _statement_matches_action, _statement_matches_resource, _get_condition_match
+from principalmapper.querying.local_policy_simulation import _matches_after_expansion, _statement_matches_action, _statement_matches_resource, _get_condition_match, UnsupportedConditionOperatorError
 from principalmapper.util.case_insensitive_dict import CaseInsensitiveDict
 
 
@@ -101,6 +101,78 @@ class TestLocalPolicyStatementMatching(unittest.TestCase):
             ),
             'Condition keys are supposed to be case-insensitive'
         )
+
+    def test_unsupported_condition_operator_raises(self):
+        """Unrecognized condition operators must fail closed and be visible to the caller rather than being
+        silently ignored."""
+        context = CaseInsensitiveDict({'aws:username': 'asdf'})
+        with self.assertRaises(UnsupportedConditionOperatorError):
+            _get_condition_match({'BogusOperator': {'aws:username': 'asdf'}}, context)
+        with self.assertRaises(UnsupportedConditionOperatorError):
+            _get_condition_match({'ForAllValues:BogusOperator': {'aws:username': 'asdf'}}, context)
+        with self.assertRaises(UnsupportedConditionOperatorError):
+            _get_condition_match({'ForAnyValue:BogusOperator': {'aws:username': 'asdf'}}, context)
+
+    def test_supported_condition_operators_still_evaluated(self):
+        """The fail-closed check must not change the semantics of the supported operators, including IfExists and
+        the ForAllValues/ForAnyValue set operators."""
+        # String / IfExists: missing key is satisfied
+        self.assertTrue(_get_condition_match(
+            {'StringEqualsIfExists': {'aws:username': 'asdf'}},
+            CaseInsensitiveDict({})
+        ))
+        self.assertFalse(_get_condition_match(
+            {'StringEqualsIfExists': {'aws:username': 'asdf'}},
+            CaseInsensitiveDict({'aws:username': 'other'})
+        ))
+
+        # Numeric
+        self.assertTrue(_get_condition_match(
+            {'NumericLessThan': {'aws:MultiFactorAuthAge': '3600'}},
+            CaseInsensitiveDict({'aws:MultiFactorAuthAge': '60'})
+        ))
+        self.assertFalse(_get_condition_match(
+            {'NumericLessThan': {'aws:MultiFactorAuthAge': '3600'}},
+            CaseInsensitiveDict({'aws:MultiFactorAuthAge': '7200'})
+        ))
+
+        # Date
+        self.assertTrue(_get_condition_match(
+            {'DateGreaterThan': {'aws:CurrentTime': '2020-01-01T00:00:00Z'}},
+            CaseInsensitiveDict({'aws:CurrentTime': '2021-01-01T00:00:00Z'})
+        ))
+
+        # Bool
+        self.assertTrue(_get_condition_match(
+            {'Bool': {'aws:SecureTransport': 'true'}},
+            CaseInsensitiveDict({'aws:SecureTransport': 'true'})
+        ))
+
+        # ARN
+        self.assertTrue(_get_condition_match(
+            {'ArnEquals': {'aws:SourceArn': 'arn:aws:s3:::bucket'}},
+            CaseInsensitiveDict({'aws:SourceArn': 'arn:aws:s3:::bucket'})
+        ))
+
+        # Null
+        self.assertTrue(_get_condition_match(
+            {'Null': {'aws:TokenIssueTime': 'true'}},
+            CaseInsensitiveDict({})
+        ))
+
+        # ForAllValues / ForAnyValue set operators
+        self.assertTrue(_get_condition_match(
+            {'ForAllValues:StringEquals': {'aws:TagKeys': 'a'}},
+            CaseInsensitiveDict({'aws:TagKeys': ['a']})
+        ))
+        self.assertFalse(_get_condition_match(
+            {'ForAllValues:StringEquals': {'aws:TagKeys': 'a'}},
+            CaseInsensitiveDict({'aws:TagKeys': ['a', 'b']})
+        ))
+        self.assertTrue(_get_condition_match(
+            {'ForAnyValue:StringEquals': {'aws:TagKeys': 'a'}},
+            CaseInsensitiveDict({'aws:TagKeys': ['a', 'b']})
+        ))
 
 
 class TestLocalPolicyVariableExpansions(unittest.TestCase):
